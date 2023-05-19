@@ -121,8 +121,8 @@ pip install super-gradients
 ```
     
 ### 🎒 Prepare Dataset
-Your custom dataset should be in **COCO** data format.<br>
-**COCO Data Format**:
+Your custom dataset should be in **COCO** or **YOLO** data format.<br>
+**Data Format**:
 ```
 ├── Dataset
 │   ├── train
