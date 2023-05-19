@@ -52,13 +52,6 @@ Check it out here: [YOLO-NAS](YOLONAS.md).
 <img src="./documentation/source/images/yolo_nas_frontier.png" width="800px">
 </div>
 
-```python
-# Load model with pretrained weights
-from super_gradients.training import models
-from super_gradients.common.object_names import Models
-
-model = models.get(Models.YOLO_NAS_M, pretrained_weights="coco")
-```
 #### All Computer Vision Models - Pretrained Checkpoints can be found in the [Model Zoo](http://bit.ly/41dkt89)
 
 #### Classification
@@ -81,35 +74,6 @@ model = models.get(Models.YOLO_NAS_M, pretrained_weights="coco")
 
 Easily load and fine-tune production-ready, pre-trained SOTA models that incorporate best practices and validated hyper-parameters for achieving best-in-class accuracy. 
 For more information on how to do it go to [Getting Started](#getting-started)
-    
-
-#### Plug and play recipes
-```bash
-python -m super_gradients.train_from_recipe architecture=regnetY800 dataset_interface.data_dir=<YOUR_Imagenet_LOCAL_PATH> ckpt_root_dir=<CHEKPOINT_DIRECTORY>
-```
-More example on how and why to use recipes can be found in [Recipes](#recipes)
-
-
-### Production readiness
-All SuperGradients models’ are production ready in the sense that they are compatible with deployment tools such as TensorRT (Nvidia) and OpenVINO (Intel) and can be easily taken into production. With a few lines of code you can easily integrate the models into your codebase.
-```python
-# Load model with pretrained weights
-from super_gradients.training import models
-from super_gradients.common.object_names import Models
-
-model = models.get(Models.YOLO_NAS_M, pretrained_weights="coco")
-
-# Prepare model for conversion
-# Input size is in format of [Batch x Channels x Width x Height] where 640 is the standard COCO dataset dimensions
-model.eval()
-model.prep_model_for_conversion(input_size=[1, 3, 640, 640])
-    
-# Create dummy_input
-
-# Convert model to onnx
-torch.onnx.export(model, dummy_input,  "yolo_nas_m.onnx")
-```
-More information on how to take your model to production can be found in [Getting Started](#getting-started) notebooks
 
 ## Quick Installation
 
@@ -266,28 +230,6 @@ ________________________________________________________________________________
 
 <!-- tocstop -->
 
-## Getting Started
-__________________________________________________________________________________________________________
-
-### Start Training with Just 1 Command Line
-The most simple and straightforward way to start training SOTA performance models with SuperGradients reproducible recipes. Just define your dataset path and where you want your checkpoints to be saved and you are good to go from your terminal!
-
-Just make sure that you [setup your dataset](https://github.com/Deci-AI/super-gradients/blob/master/src/super_gradients/training/datasets/Dataset_Setup_Instructions.md) according to the data dir specified in the recipe.
-
-```bash
-python -m super_gradients.train_from_recipe --config-name=imagenet_regnetY architecture=regnetY800 dataset_interface.data_dir=<YOUR_Imagenet_LOCAL_PATH> ckpt_root_dir=<CHEKPOINT_DIRECTORY>
-```
-### Quickly Load Pre-Trained Weights for Your Desired Model with SOTA Performance
-Want to try our pre-trained models on your machine? Import SuperGradients, initialize your Trainer, and load your desired architecture and pre-trained weights from our [SOTA model zoo](http://bit.ly/41dkt89)
-
-```python
-# The pretrained_weights argument will load a pre-trained architecture on the provided dataset
-    
-import super_gradients
-
-model = models.get("model-name", pretrained_weights="pretrained-model-name")
-
-```   
 ###  Classification
 
 #### Transfer Learning 
