@@ -1,0 +1,17 @@
+# CODE OWNERS
+
+# AUTOMATION
+.circleci/config.yml    @ranrubin
+
+# MODELS, LOSSES, METRICS, UTILS
+super_gradients/training/models/          @shairoz-deci @NatanBagrov @najeeb5 @shanibenbaruch @yurkovak @lkdci
+super_gradients/training/losses/          @shairoz-deci @NatanBagrov @najeeb5 @shanibenbaruch @yurkovak @lkdci
+super_gradients/training/metrics/         @shairoz-deci @NatanBagrov @najeeb5 @shanibenbaruch @yurkovak @lkdci
+super_gradients/training/utils/           @shairoz-deci @NatanBagrov @najeeb5 @shanibenbaruch @yurkovak @lkdci
+super_gradients/training/tests/           @shairoz-deci @NatanBagrov @najeeb5 @shanibenbaruch @yurkovak @lkdci
+super_gradients/training/examples/        @shairoz-deci @NatanBagrov @najeeb5 @shanibenbaruch @yurkovak @lkdci
+super_gradients/training/params.py        @shairoz-deci @NatanBagrov @najeeb5 @shanibenbaruch @yurkovak @lkdci
+
+
+#   ALL OF super_gradients REPO
+*   @shaydeci @ofrimasad @BloodAxe @Louis-Dupont
