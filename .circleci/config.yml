@@ -1,0 +1,872 @@
+version: 2.1
+
+parameters:
+  ad_hoc_container_build:
+    type: boolean
+    default: false
+  ad_hoc_container_build_code_only:
+    type: boolean
+    default: false
+  remote_docker_version:
+    type: string
+    description: remote docker version
+    default: "20.10.18"
+  sg_docker_version:
+    type: string
+    description: the version of super gradients docker image
+    default: "2.0.0"
+  orb_version:
+    type: string
+    description: Deci ai ORB version https://circleci.com/developer/orbs/orb/deci-ai/circleci-common-orb
+    default: "10.5.1"
+#    default: "dev:alpha"
+
+orbs:
+  deci-common: deci-ai/circleci-common-orb@<< pipeline.parameters.orb_version >>
+  aws-ecr: circleci/aws-ecr@8.2.1
+  docker: circleci/docker@2.2.0
+  slack: circleci/slack@4.12.0 # see https://circleci.com/developer/orbs/orb/circleci/slack for examples and more
+
+# This filter operates on SemVer2 tags only
+release_tag_filter: &release_tag_filter
+  filters:
+    branches:
+      ignore: /.*/
+    tags:
+      only: /^\d+\.\d+\.\d+$/
+
+release_candidate_filter: &release_candidate_filter
+  filters:
+    branches:
+      only: master
+
+release_candidate_tag_filter: &release_candidate_tag_filter
+  filters:
+    branches:
+      ignore: /.*/
+    tags:
+      only: /^\d+\.\d+\.\d+rc\d+/
+
+commands:
+  build_and_publish_command:
+    parameters:
+      repo_name:
+        type: string
+      docker_context:
+        type: string
+      image_tag:
+        type: string
+      additional_tags:
+        type: string
+      build_args:
+        type: string
+        default: ""
+      dockerfile:
+        type: string
+        default: "Dockerfile"
+    steps:
+      - checkout
+      - attach_workspace:
+          at: ~/
+      - run:
+          name: Put config dir in repo context
+          command: |
+            if [ -d ~/.config ]; then
+              echo "found a .config directory, copying to repo dir"
+              cp -r  ~/.config ~/project/<< parameters.docker_context >>
+            fi
+      - deci-common/ecr_login_dev
+      - deci-common/container_image_build:
+          context: << parameters.docker_context >>
+          working_directory: "."
+          repository_name: << parameters.repo_name >>
+          image_tag: << parameters.image_tag >>
+          dockerfile: << parameters.dockerfile >>
+          build_args: << parameters.build_args >>
+      #          build_args: "PYTHON_VERSION=3.8 SG_VERSION=3.0.7"
+      - deci-common/push_docker_image_aws_dev:
+          repository_name: << parameters.repo_name >>
+          image_tag: << parameters.image_tag >>
+          additional_tags: << parameters.additional_tags >>
+
+  get_beta_and_rc_tags:
+    description: "getting beta and rc tag (if exist) according to ouir convention"
+    steps:
+        - attach_workspace:
+           at: ~/
+        - run:
+           name: push BETA_TAG and RC_TAG variable to BASH_ENV
+           command: |
+              if [[ -f ~/BETA_TAG ]]; then
+                echo 'export BETA_TAG="$(cat ~/BETA_TAG)"' >> "$BASH_ENV"
+                source $BASH_ENV
+              fi
+
+              if [[ -f ~/RC_TAG ]]; then
+                echo 'export RC_TAG="$(cat ~/RC_TAG)"' >> "$BASH_ENV"
+                source $BASH_ENV
+              fi 
+              echo "RC_TAG=$RC_TAG   ||  BETA_TAG=$BETA_TAG"
+
+  adding_tag_to_ecr_container_image:
+   description: adding a tag to an existing  container image
+   parameters:
+    image_repo:
+      type: string
+    new_image_tag:
+      type: string
+    source_image_tag:
+      type: string
+   steps:
+     - deci-common/run_on_dev_account:
+           command: |
+              MANIFEST=$(aws ecr batch-get-image --repository-name << parameters.image_repo >> --image-ids imageTag=<< parameters.source_image_tag >> --query 'images[].imageManifest' --output text)
+              aws ecr put-image --repository-name << parameters.image_repo >> --image-tag << parameters.new_image_tag >> --image-manifest "$MANIFEST"
+              echo "added tag: << parameters.new_image_tag >>    to image:  << parameters.image_repo >>:<< parameters.new_image_tag >>"
+
+jobs:
+  build:
+    environment:
+      CIRCLE_COMPARE_URL: << pipeline.project.git_url >>/compare/<< pipeline.git.base_revision >>..<<pipeline.git.revision>>
+    parameters:
+      py_version:
+        type: string
+        default: latest
+      package_name:
+        type: string
+    docker:
+      - image: cimg/python:<< parameters.py_version >>
+    resource_class: large
+    steps:
+      - deci-common/checkout_and_skip_build:
+          check_version_file: true
+          skip_md_files: true
+      - deci-common/get_persisted_version_info
+      - unless:
+          condition:
+            equal: [ master, << pipeline.git.branch >> ]
+          steps:
+            - run:
+                name: install Black Flake8 python linter
+                command: |
+                  pip install --user -r requirements.dev.txt
+            - run:
+                name: Lint all python files changed since develop branch
+                command: |
+                  flake8 --statistics --config scripts/flake8-config setup.py $(git diff --diff-filter ACM origin/master --name-only | grep 'py$' | grep -v 'experimental/' | grep -v 'experimental_models/')
+            - run:
+                name: Run Black on changed files against master branch
+                command: |
+                  black --check setup.py $(git diff --diff-filter ACM origin/master --name-only | grep 'py$' | grep -v 'experimental/' | grep -v 'experimental_models/')
+      - run:
+          name: add requirements.txt and requirements.pro.txt to source code
+          command: |
+            cp requirements.txt src/super_gradients/requirements.txt
+            cp requirements.pro.txt src/super_gradients/requirements.pro.txt
+      - run:
+          name: install python dependencies
+          command: |
+            python3 -m venv venv
+            . venv/bin/activate
+            python3 -m pip install pip==23.1.2
+            cat requirements.txt | cut -f1 -d"#" | xargs -n 1 -L 1 pip install --progress-bar off
+      - run:
+          name: edit package version
+          command: |
+            echo "${NEW_VERSION}" > version.txt
+            cat version.txt
+      - run:
+          name: setup custom environment variables
+          command: |
+            echo 'export PYTHONPATH=/home/circleci/super_gradients' >> $BASH_ENV
+            echo 'export UPLOAD_LOGS=FALSE' >> $BASH_ENV
+      - run:
+          name: install package
+          no_output_timeout: 30m
+          command: |
+            . venv/bin/activate
+            python3 -m pip install --extra-index-url https://pypi.ngc.nvidia.com .[pro]
+      - run:
+          name: run tests with coverage
+          no_output_timeout: 30m
+          command: |
+            . venv/bin/activate
+            coverage run --source=super_gradients -m unittest tests/deci_core_unit_test_suite_runner.py
+            coverage report
+            coverage html  # open htmlcov/index.html in a browser
+      - store_artifacts:
+          path: htmlcov
+
+      - store_artifacts:
+          path: ~/sg_logs
+
+  change_rc_to_b:
+     description: "change rc in the tag to b"
+     docker:
+       - image: cimg/base:stable-20.04
+     resource_class: small
+     steps:
+       - run:
+          name: change the rc to b
+          command:
+           |
+            BETA_TAG=$(echo ${CIRCLE_TAG} | sed -e  's|rc|b|'); echo ${BETA_TAG} >> ~/BETA_TAG
+            cat ~/BETA_TAG
+       - persist_to_workspace:
+           root: ~/
+           paths:
+             - "BETA_TAG"
+
+
+
+
+  build_and_publish_sg_container:
+    description : "building the temp image and pushing to dev ecr"
+    parameters:
+       repo_name:
+         type: string
+         default: 'deci/super-gradients'
+       sg_python_version:
+         type: string
+         default: $CIRCLE_TAG
+    docker:
+       - image: cimg/base:stable-20.04
+    resource_class: small
+    steps:
+     - checkout
+     - get_beta_and_rc_tags
+     - run:
+         command: echo *$BETA_TAG*
+     - setup_remote_docker:
+          version: << pipeline.parameters.remote_docker_version >>
+          docker_layer_caching: true
+     - deci-common/container_image_build:
+           dockerfile: scripts/Dockerfile
+           repository_name: << parameters.repo_name >>
+           image_tag: "$BETA_TAG"
+           build_args: 'SG_VERSION=<< parameters.sg_python_version >>'
+           extra_flags: ' --compress'
+     - deci-common/push_docker_image_aws_dev:
+           repository_name: << parameters.repo_name >>
+           image_tag: "$BETA_TAG"
+           additional_tags: "latest"
+
+  find_rc_tag_per_sha:
+   description: this command will take the sha of the last commit and find the rc tag it belongs to as ${RC_TAG} variale
+   docker:
+      - image: cimg/aws:2022.11.1
+   resource_class: small
+   steps:
+     - checkout
+     - run:
+          name: get rc tag of the final tag
+          command: |
+              if [[ $(RC_TAG=$(git tag --contains ${CIRCLE_SHA1} | grep -E '[[:digit:]]+\.[[:digit:]]+\.[[:digit:]]+rc[[:digit:]]+' | head -n 1)) ]] ; then
+                echo "Found RC version: ${RC_TAG}"
+                echo $RC_TAG >> ~/RC_TAG
+              else
+               echo "No Rc Tag found for commit"
+               circleci-agent step halt
+              fi
+
+     - persist_to_workspace:
+           root: ~/
+           paths:
+             - "RC_TAG"
+
+
+  add_rc_tag_to_beta:
+   description: in the event of successful test promote beta to rc
+   parameters:
+     image_repo:
+        type: string
+        default: "deci/super-gradients"
+   docker:
+       - image: cimg/base:stable-20.04
+   resource_class: small
+   steps:
+     - get_beta_and_rc_tags
+     - run:
+         command: |
+           echo $BETA_TAG
+     - adding_tag_to_ecr_container_image:
+        image_repo: << parameters.image_repo >>
+        source_image_tag: $BETA_TAG
+        new_image_tag: $CIRCLE_TAG
+
+  add_release_tag_to_rc:
+    description: in the event of successful test promote rc to release and latest
+    parameters:
+      image_repo:
+        type: string
+        default: "deci/super-gradients"
+    docker:
+      - image: cimg/base:stable-20.04
+    resource_class: small
+    steps:
+      - get_beta_and_rc_tags
+      - run:
+          command: |
+            if [ -z $RC_TAG ] ; then
+              circleci-agent step halt
+            else
+              echo $RC_TAG
+            fi
+      - adding_tag_to_ecr_container_image:
+          image_repo: << parameters.image_repo >>
+          source_image_tag: $RC_TAG
+          new_image_tag: ${CIRCLE_TAG}
+
+  testing_supergradients_docker_image:
+    description: "running integration test on the code"
+    parameters:
+      image_repo:
+        type: string
+    #reserved for testing when will be done
+    #machine: true
+    #resource_class: deci-ai/research-standard
+    docker:
+      - image: cimg/base:stable-20.04
+    steps:
+        - deci-common/ecr_login_dev
+        - get_beta_and_rc_tags
+        # - run:
+        #    name: integration test
+        #    #command: sudo docker run -it -e ENVIRONMENT_NAME=production -v ${PWD}:/SG -v /data:/data deciai/super-gradients:3.0.0 python3 ./tests/integration_tests/pretrained_models_test.py
+        #    command: docker run --rm -it --shm-size=2gb --gpus all -v ${PWD}:/SG -v /data:/data << parameters.image_repo >>:<< parameters.image_tag >> python3 -c 'print("it works!")'
+        -  run:
+             command: echo Hello world
+
+
+  release_candidate:
+    environment:
+      CIRCLE_COMPARE_URL: << pipeline.project.git_url >>/compare/<< pipeline.git.base_revision >>..<<pipeline.git.revision>>
+    parameters:
+      py_version:
+        type: string
+    docker:
+      - image: cimg/python:<< parameters.py_version >>
+    steps:
+      - deci-common/checkout_and_skip_build:
+          check_version_file: true
+          skip_md_files: true
+
+      - deci-common/get_persisted_version_info
+      - run:
+          name: edit package version
+          command: |
+            echo $NEW_VERSION > version.txt
+      - deci-common/pip_upload_package_codeartifact_dev:
+          codeartifact_repository: "deci-packages"
+      - deci-common/pip_test_package_installation_codeartifact_dev:
+          package_name: "super-gradients"
+          version: $NEW_VERSION
+      - deci-common/git_config_automation_user
+      - run:
+          name: "commit version file"
+          command: |
+            git commit version.txt -m "Deci Services - Changed version to $NEW_VERSION"
+      - deci-common/git_commit_and_tag:
+          version: $NEW_VERSION
+
+  release_version:
+    environment:
+      CIRCLE_COMPARE_URL: << pipeline.project.git_url >>/compare/<< pipeline.git.base_revision >>..<<pipeline.git.revision>>
+    parameters:
+      py_version:
+        type: string
+      dev_venv_name:
+        type: string
+        default: "dev-sg-${CIRCLE_BUILD_NUM}"
+    docker:
+      - image: cimg/python:<< parameters.py_version >>
+    steps:
+      - deci-common/checkout_and_skip_build:
+          check_version_file: true
+          skip_md_files: false
+      - run:
+          name: add requirements.txt and requirements.pro.txt to source code
+          command: |
+            cp requirements.txt src/super_gradients/requirements.txt
+            cp requirements.pro.txt src/super_gradients/requirements.pro.txt
+      - run:
+          name: edit package version
+          command: |
+            echo $CIRCLE_TAG > version.txt
+
+      - deci-common/pip_upload_package_codeartifact_all_accounts:
+          codeartifact_repository: "deci-packages"
+
+      - deci-common/pip_test_package_installation_codeartifact_dev:
+          package_name: "super-gradients"
+          version: $CIRCLE_TAG
+          venv_name: << parameters.dev_venv_name >>
+      - run:
+          name: verify that the output of __version__ is what we expect
+          command: |
+            . << parameters.dev_venv_name >>-super-gradients-$CIRCLE_TAG/bin/activate
+            python3 tests/verify_version.py $CIRCLE_TAG
+
+      - deci-common/pip_test_package_installation_codeartifact_prod:
+          package_name: "super-gradients"
+          version: $CIRCLE_TAG
+
+      - deci-common/pip_upload_package_codeartifact_prod:
+          codeartifact_repository: "deci-toolkit"
+
+      - deci-common/git_commit_and_tag:
+          version: $CIRCLE_TAG
+          delete_remote_tag_before_tagging: true
+
+      - deci-common/tag_as:
+          tag_name: "stable"
+          delete_remote: true
+
+      - deci-common/github_create_release:
+          github_cli_token: $GITHUB_CLI_TOKEN
+          directory_to_cd_into: "."
+          tag: $CIRCLE_TAG
+          notes: "This GitHub Release was done automatically by CircleCI"
+
+
+  recipe_accuracy_tests:
+    docker:
+      - image: 307629990626.dkr.ecr.us-east-1.amazonaws.com/deci/infra/circleci/runner/sg-gpu:<< pipeline.parameters.sg_docker_version >>
+    resource_class: deci-ai/sg-gpu-on-premise
+    parameters:
+      sg_existing_env_path:
+        type: string
+        default: "/env/persistent_env"
+      sg_new_env_name:
+        type: string
+        default: "${CIRCLE_BUILD_NUM}"
+      sg_new_env_python_version:
+        type: string
+        default: "python3.8"
+    steps:
+      - checkout
+      - run:
+          name: install requirements and run recipe tests
+          command: |
+            << parameters.sg_new_env_python_version >> -m venv << parameters.sg_new_env_name >>
+            source << parameters.sg_new_env_name >>/bin/activate
+            python3.8 -m pip install --upgrade setuptools pip wheel
+            python3.8 -m pip install -r requirements.txt
+            python3.8 -m pip install .
+            python3.8 -m pip install torch torchvision torchaudio
+            python3.8 src/super_gradients/examples/train_from_recipe_example/train_from_recipe.py --config-name=coco2017_pose_dekr_w32_no_dc experiment_name=shortened_coco2017_pose_dekr_w32_ap_test batch_size=4 val_batch_size=8 epochs=1 training_hyperparams.lr_warmup_steps=0 training_hyperparams.average_best_models=False training_hyperparams.max_train_batches=1000 training_hyperparams.max_valid_batches=100 multi_gpu=DDP num_gpus=4
+            python3.8 src/super_gradients/examples/train_from_recipe_example/train_from_recipe.py --config-name=cifar10_resnet experiment_name=shortened_cifar10_resnet_accuracy_test epochs=100 training_hyperparams.average_best_models=False multi_gpu=DDP num_gpus=4
+            python3.8 src/super_gradients/examples/convert_recipe_example/convert_recipe_example.py --config-name=cifar10_conversion_params experiment_name=shortened_cifar10_resnet_accuracy_test
+            python3.8 src/super_gradients/examples/train_from_recipe_example/train_from_recipe.py --config-name=coco2017_yolox experiment_name=shortened_coco2017_yolox_n_map_test architecture=yolox_n training_hyperparams.loss=yolox_fast_loss epochs=10 training_hyperparams.average_best_models=False multi_gpu=DDP num_gpus=4
+            python3.8 src/super_gradients/examples/train_from_recipe_example/train_from_recipe.py --config-name=cityscapes_regseg48 experiment_name=shortened_cityscapes_regseg48_iou_test epochs=10 training_hyperparams.average_best_models=False multi_gpu=DDP num_gpus=4
+            coverage run --source=super_gradients -m unittest tests/deci_core_recipe_test_suite_runner.py
+
+      - run:
+          name: Remove new environment when failed
+          command: "rm -r << parameters.sg_new_env_name >>"
+          when: on_fail
+
+  recipe_sanity_tests_classification_pt1:
+    docker:
+      - image: 307629990626.dkr.ecr.us-east-1.amazonaws.com/deci/infra/circleci/runner/sg-gpu:<< pipeline.parameters.sg_docker_version >>
+    resource_class: deci-ai/sg-gpu-on-premise
+    parameters:
+      sg_existing_env_path:
+        type: string
+        default: "/env/persistent_env"
+      sg_new_env_name:
+        type: string
+        default: "${CIRCLE_BUILD_NUM}"
+      sg_new_env_python_version:
+        type: string
+        default: "python3.8"
+    steps:
+      - checkout
+      - run:
+          name: install requirements and run classification sanity tests
+          command: |
+            << parameters.sg_new_env_python_version >> -m venv << parameters.sg_new_env_name >>
+            source << parameters.sg_new_env_name >>/bin/activate
+            ls /data/
+            python3.8 -m pip install --upgrade setuptools pip wheel
+            python3.8 -m pip install -r requirements.txt
+            python3.8 -m pip install .
+            python3.8 -m pip install torch torchvision torchaudio
+            python3.8 src/super_gradients/examples/train_from_recipe_example/train_from_recipe.py --config-name=imagenet_regnetY architecture=regnetY600 batch_size=8 val_batch_size=16 epochs=1 training_hyperparams.average_best_models=False training_hyperparams.max_train_batches=100 training_hyperparams.max_valid_batches=100 multi_gpu=DDP num_gpus=4 dataset_params.train_dataset_params.root=/data/Imagenet/train dataset_params.val_dataset_params.root=/data/Imagenet/val
+            python3.8 src/super_gradients/examples/train_from_recipe_example/train_from_recipe.py --config-name=imagenet_regnetY architecture=regnetY800 batch_size=8 val_batch_size=16 epochs=1 training_hyperparams.average_best_models=False training_hyperparams.max_train_batches=100 training_hyperparams.max_valid_batches=100 multi_gpu=DDP num_gpus=4 dataset_params.train_dataset_params.root=/data/Imagenet/train dataset_params.val_dataset_params.root=/data/Imagenet/val
+            python3.8 src/super_gradients/examples/train_from_recipe_example/train_from_recipe.py --config-name=imagenet_repvgg batch_size=8 val_batch_size=16 epochs=1 training_hyperparams.average_best_models=False training_hyperparams.max_train_batches=100 training_hyperparams.max_valid_batches=100 multi_gpu=DDP num_gpus=4 dataset_params.train_dataset_params.root=/data/Imagenet/train dataset_params.val_dataset_params.root=/data/Imagenet/val
+            python3.8 src/super_gradients/examples/train_from_recipe_example/train_from_recipe.py --config-name=imagenet_resnet50 batch_size=8 val_batch_size=16 epochs=1 training_hyperparams.average_best_models=False training_hyperparams.max_train_batches=100 training_hyperparams.max_valid_batches=100 multi_gpu=DDP num_gpus=4 dataset_params.train_dataset_params.root=/data/Imagenet/train dataset_params.val_dataset_params.root=/data/Imagenet/val
+            python3.8 src/super_gradients/examples/train_from_recipe_example/train_from_recipe.py --config-name=imagenet_vit_base batch_size=8 val_batch_size=16 epochs=1 training_hyperparams.average_best_models=False training_hyperparams.max_train_batches=100 training_hyperparams.max_valid_batches=100 multi_gpu=DDP num_gpus=4 dataset_params.train_dataset_params.root=/data/Imagenet/train dataset_params.val_dataset_params.root=/data/Imagenet/val
+            python3.8 src/super_gradients/examples/train_from_kd_recipe_example/train_from_kd_recipe.py --config-name=imagenet_resnet50_kd batch_size=8 val_batch_size=8 epochs=1 training_hyperparams.average_best_models=False training_hyperparams.max_train_batches=100 training_hyperparams.max_valid_batches=100 multi_gpu=DDP num_gpus=4 dataset_params.train_dataset_params.root=/data/Imagenet/train dataset_params.val_dataset_params.root=/data/Imagenet/val
+
+      - run:
+          name: Remove new environment when failed
+          command: "rm -r << parameters.sg_new_env_name >>"
+          when: on_fail
+  recipe_sanity_tests_classification_pt2:
+    docker:
+      - image: 307629990626.dkr.ecr.us-east-1.amazonaws.com/deci/infra/circleci/runner/sg-gpu:<< pipeline.parameters.sg_docker_version >>
+    resource_class: deci-ai/sg-gpu-on-premise
+    parameters:
+      sg_existing_env_path:
+        type: string
+        default: "/env/persistent_env"
+      sg_new_env_name:
+        type: string
+        default: "${CIRCLE_BUILD_NUM}"
+      sg_new_env_python_version:
+        type: string
+        default: "python3.8"
+    steps:
+      - checkout
+      - run:
+          name: install requirements and run classification sanity tests
+          command: |
+            << parameters.sg_new_env_python_version >> -m venv << parameters.sg_new_env_name >>
+            source << parameters.sg_new_env_name >>/bin/activate
+            python3.8 -m pip install --upgrade setuptools pip wheel
+            python3.8 -m pip install -r requirements.txt
+            python3.8 -m pip install .
+            python3.8 -m pip install torch torchvision torchaudio
+            python3.8 src/super_gradients/examples/train_from_recipe_example/train_from_recipe.py --config-name=imagenet_efficientnet batch_size=8 val_batch_size=16 epochs=1 training_hyperparams.average_best_models=False training_hyperparams.max_train_batches=100 training_hyperparams.max_valid_batches=100 multi_gpu=DDP num_gpus=4 dataset_params.train_dataset_params.root=/data/Imagenet/train dataset_params.val_dataset_params.root=/data/Imagenet/val
+            python3.8 src/super_gradients/examples/train_from_recipe_example/train_from_recipe.py --config-name=imagenet_mobilenetv2 batch_size=8 val_batch_size=16 epochs=1 training_hyperparams.average_best_models=False training_hyperparams.max_train_batches=100 training_hyperparams.max_valid_batches=100 multi_gpu=DDP num_gpus=4 dataset_params.train_dataset_params.root=/data/Imagenet/train dataset_params.val_dataset_params.root=/data/Imagenet/val
+            python3.8 src/super_gradients/examples/train_from_recipe_example/train_from_recipe.py --config-name=imagenet_mobilenetv3_large batch_size=8 val_batch_size=16 epochs=1 training_hyperparams.average_best_models=False training_hyperparams.max_train_batches=100 training_hyperparams.max_valid_batches=100 multi_gpu=DDP num_gpus=4 dataset_params.train_dataset_params.root=/data/Imagenet/train dataset_params.val_dataset_params.root=/data/Imagenet/val
+            python3.8 src/super_gradients/examples/train_from_recipe_example/train_from_recipe.py --config-name=imagenet_mobilenetv3_small batch_size=8 val_batch_size=16 epochs=1 training_hyperparams.average_best_models=False training_hyperparams.max_train_batches=100 training_hyperparams.max_valid_batches=100 multi_gpu=DDP num_gpus=4 dataset_params.train_dataset_params.root=/data/Imagenet/train dataset_params.val_dataset_params.root=/data/Imagenet/val
+            python3.8 src/super_gradients/examples/train_from_recipe_example/train_from_recipe.py --config-name=imagenet_regnetY architecture=regnetY200 batch_size=8 val_batch_size=16 epochs=1 training_hyperparams.average_best_models=False training_hyperparams.max_train_batches=100 training_hyperparams.max_valid_batches=100 multi_gpu=DDP num_gpus=4 dataset_params.train_dataset_params.root=/data/Imagenet/train dataset_params.val_dataset_params.root=/data/Imagenet/val
+            python3.8 src/super_gradients/examples/train_from_recipe_example/train_from_recipe.py --config-name=imagenet_regnetY architecture=regnetY400 batch_size=8 val_batch_size=16 epochs=1 training_hyperparams.average_best_models=False training_hyperparams.max_train_batches=100 training_hyperparams.max_valid_batches=100 multi_gpu=DDP num_gpus=4 dataset_params.train_dataset_params.root=/data/Imagenet/train dataset_params.val_dataset_params.root=/data/Imagenet/val
+      - run:
+          name: Remove new environment when failed
+          command: "rm -r << parameters.sg_new_env_name >>"
+          when: on_fail
+
+  recipe_sanity_tests_segmentation:
+    docker:
+      - image: 307629990626.dkr.ecr.us-east-1.amazonaws.com/deci/infra/circleci/runner/sg-gpu:<< pipeline.parameters.sg_docker_version >>
+    resource_class: deci-ai/sg-gpu-on-premise
+    parameters:
+      sg_existing_env_path:
+        type: string
+        default: "/env/persistent_env"
+      sg_new_env_name:
+        type: string
+        default: "${CIRCLE_BUILD_NUM}"
+      sg_new_env_python_version:
+        type: string
+        default: "python3.8"
+    steps:
+      - checkout
+      - run:
+          name: install requirements and run segmentation sanity tests
+          command: |
+            << parameters.sg_new_env_python_version >> -m venv << parameters.sg_new_env_name >>
+            source << parameters.sg_new_env_name >>/bin/activate
+            python3.8 -m pip install --upgrade setuptools pip wheel
+            python3.8 -m pip install -r requirements.txt
+            python3.8 -m pip install .
+            python3.8 -m pip install torch torchvision torchaudio
+            wget  -O $(pwd)/checkpoints/ddrnet23_slim_bb_imagenet.pth https://deci-pretrained-models.s3.amazonaws.com/ddrnet/imagenet_pt_backbones/ddrnet23_slim_bb_imagenet.pth
+            wget  -O $(pwd)/checkpoints/ddrnet23_bb_imagenet.pth https://deci-pretrained-models.s3.amazonaws.com/ddrnet/imagenet_pt_backbones/ddrnet23_bb_imagenet.pth
+            wget  -O $(pwd)/checkpoints/ddrnet39_imagenet_pretrained.pth https://deci-pretrained-models.s3.amazonaws.com/ddrnet/imagenet_pt_backbones/ddrnet39_bb_imagenet.pth
+            python3.8 src/super_gradients/examples/train_from_recipe_example/train_from_recipe.py  --config-name=cityscapes_ddrnet checkpoint_params.checkpoint_path=$(pwd)/checkpoints/ddrnet23_bb_imagenet.pth batch_size=3 val_batch_size=3 epochs=1 training_hyperparams.average_best_models=False training_hyperparams.max_train_batches=100 training_hyperparams.max_valid_batches=100 multi_gpu=DDP num_gpus=4
+            python3.8 src/super_gradients/examples/train_from_recipe_example/train_from_recipe.py  --config-name=cityscapes_ddrnet architecture=ddrnet_23_slim checkpoint_params.checkpoint_path=$(pwd)/checkpoints/ddrnet23_slim_bb_imagenet.pth batch_size=3 val_batch_size=3 epochs=1 training_hyperparams.average_best_models=False training_hyperparams.max_train_batches=100 training_hyperparams.max_valid_batches=100 multi_gpu=DDP num_gpus=4
+            python3.8 src/super_gradients/examples/train_from_recipe_example/train_from_recipe.py --config-name=cityscapes_ddrnet checkpoint_params.checkpoint_path=$(pwd)/checkpoints/ddrnet39_imagenet_pretrained.pth architecture=ddrnet_39 batch_size=3 val_batch_size=3 epochs=1 training_hyperparams.average_best_models=False training_hyperparams.max_train_batches=100 training_hyperparams.max_valid_batches=100 multi_gpu=DDP num_gpus=4
+            wget  -O $(pwd)/checkpoints/stdc1_imagenet_pretrained.pth https://deci-pretrained-models.s3.amazonaws.com/stdc_backbones/stdc1_imagenet_pretrained.pth
+            wget  -O $(pwd)/checkpoints/stdc2_imagenet_pretrained.pth https://deci-pretrained-models.s3.amazonaws.com/stdc_backbones/stdc2_imagenet_pretrained.pth
+            python3.8 src/super_gradients/examples/train_from_recipe_example/train_from_recipe.py --config-name=cityscapes_pplite_seg50 checkpoint_params.checkpoint_path=$(pwd)/checkpoints/stdc1_imagenet_pretrained.pth architecture=pp_lite_t_seg batch_size=3 val_batch_size=3 epochs=1 training_hyperparams.average_best_models=False training_hyperparams.max_train_batches=100 training_hyperparams.max_valid_batches=100 multi_gpu=DDP num_gpus=4
+            python3.8 src/super_gradients/examples/train_from_recipe_example/train_from_recipe.py --config-name=cityscapes_pplite_seg50 checkpoint_params.checkpoint_path=$(pwd)/checkpoints/stdc2_imagenet_pretrained.pth architecture=pp_lite_b_seg batch_size=3 val_batch_size=3 epochs=1 training_hyperparams.average_best_models=False training_hyperparams.max_train_batches=100 training_hyperparams.max_valid_batches=100 multi_gpu=DDP num_gpus=4
+            python3.8 src/super_gradients/examples/train_from_recipe_example/train_from_recipe.py --config-name=cityscapes_pplite_seg75 checkpoint_params.checkpoint_path=$(pwd)/checkpoints/stdc1_imagenet_pretrained.pth architecture=pp_lite_t_seg batch_size=3 val_batch_size=3 epochs=1 training_hyperparams.average_best_models=False training_hyperparams.max_train_batches=100 training_hyperparams.max_valid_batches=100 multi_gpu=DDP num_gpus=4
+            python3.8 src/super_gradients/examples/train_from_recipe_example/train_from_recipe.py --config-name=cityscapes_pplite_seg75 checkpoint_params.checkpoint_path=$(pwd)/checkpoints/stdc2_imagenet_pretrained.pth architecture=pp_lite_b_seg batch_size=3 val_batch_size=3 epochs=1 training_hyperparams.average_best_models=False training_hyperparams.max_train_batches=100 training_hyperparams.max_valid_batches=100 multi_gpu=DDP num_gpus=4
+            python3.8 src/super_gradients/examples/train_from_recipe_example/train_from_recipe.py --config-name=cityscapes_stdc_seg50 checkpoint_params.checkpoint_path=$(pwd)/checkpoints/stdc1_imagenet_pretrained.pth batch_size=3 val_batch_size=3 epochs=1 training_hyperparams.average_best_models=False training_hyperparams.max_train_batches=100 training_hyperparams.max_valid_batches=100 multi_gpu=DDP num_gpus=4
+            python3.8 src/super_gradients/examples/train_from_recipe_example/train_from_recipe.py --config-name=cityscapes_stdc_seg50 checkpoint_params.checkpoint_path=$(pwd)/checkpoints/stdc2_imagenet_pretrained.pth architecture=stdc2_seg batch_size=3 val_batch_size=3 epochs=1 training_hyperparams.average_best_models=False training_hyperparams.max_train_batches=100 training_hyperparams.max_valid_batches=100 multi_gpu=DDP num_gpus=4
+            python3.8 src/super_gradients/examples/train_from_recipe_example/train_from_recipe.py --config-name=cityscapes_stdc_seg75 checkpoint_params.checkpoint_path=$(pwd)/checkpoints/stdc1_imagenet_pretrained.pth batch_size=3 val_batch_size=3 epochs=1 training_hyperparams.average_best_models=False training_hyperparams.max_train_batches=100 training_hyperparams.max_valid_batches=100 multi_gpu=DDP num_gpus=4
+            python3.8 src/super_gradients/examples/train_from_recipe_example/train_from_recipe.py --config-name=cityscapes_stdc_seg75 checkpoint_params.checkpoint_path=$(pwd)/checkpoints/stdc2_imagenet_pretrained.pth architecture=stdc2_seg batch_size=3 val_batch_size=3 epochs=1 training_hyperparams.average_best_models=False training_hyperparams.max_train_batches=100 training_hyperparams.max_valid_batches=100 multi_gpu=DDP num_gpus=4
+      - run:
+          name: Remove new environment when failed
+          command: "rm -r << parameters.sg_new_env_name >>"
+          when: on_fail
+
+  recipe_sanity_tests_detection:
+    docker:
+      - image: 307629990626.dkr.ecr.us-east-1.amazonaws.com/deci/infra/circleci/runner/sg-gpu:<< pipeline.parameters.sg_docker_version >>
+    resource_class: deci-ai/sg-gpu-on-premise
+    parameters:
+      sg_existing_env_path:
+        type: string
+        default: "/env/persistent_env"
+      sg_new_env_name:
+        type: string
+        default: "${CIRCLE_BUILD_NUM}"
+      sg_new_env_python_version:
+        type: string
+        default: "python3.8"
+    steps:
+      - checkout
+      - run:
+          name: install requirements and run detection sanity tests
+          command: |
+            << parameters.sg_new_env_python_version >> -m venv << parameters.sg_new_env_name >>
+            source << parameters.sg_new_env_name >>/bin/activate
+            python3.8 -m pip install --upgrade setuptools pip wheel
+            python3.8 -m pip install -r requirements.txt
+            python3.8 -m pip install .
+            python3.8 -m pip install torch torchvision torchaudio
+            python3.8 src/super_gradients/examples/train_from_recipe_example/train_from_recipe.py --config-name=coco2017_ssd_lite_mobilenet_v2 batch_size=8 val_batch_size=16 epochs=1 training_hyperparams.average_best_models=False training_hyperparams.max_train_batches=100 training_hyperparams.max_valid_batches=100 multi_gpu=DDP num_gpus=4
+            python3.8 src/super_gradients/examples/train_from_recipe_example/train_from_recipe.py --config-name=coco2017_yolox architecture=yolox_n batch_size=8 val_batch_size=16 epochs=1 training_hyperparams.average_best_models=False training_hyperparams.max_train_batches=100 training_hyperparams.max_valid_batches=100 multi_gpu=DDP num_gpus=4
+            python3.8 src/super_gradients/examples/train_from_recipe_example/train_from_recipe.py --config-name=coco2017_yolox architecture=yolox_t batch_size=8 val_batch_size=16 epochs=1 training_hyperparams.average_best_models=False training_hyperparams.max_train_batches=100 training_hyperparams.max_valid_batches=100 multi_gpu=DDP num_gpus=4
+            python3.8 src/super_gradients/examples/train_from_recipe_example/train_from_recipe.py --config-name=coco2017_yolox architecture=yolox_s batch_size=8 val_batch_size=16 epochs=1 training_hyperparams.average_best_models=False training_hyperparams.max_train_batches=100 training_hyperparams.max_valid_batches=100 multi_gpu=DDP num_gpus=4
+            python3.8 src/super_gradients/examples/train_from_recipe_example/train_from_recipe.py --config-name=coco2017_yolox architecture=yolox_m batch_size=8 val_batch_size=8 epochs=1 training_hyperparams.average_best_models=False training_hyperparams.max_train_batches=100 training_hyperparams.max_valid_batches=100 multi_gpu=DDP num_gpus=4
+            python3.8 src/super_gradients/examples/train_from_recipe_example/train_from_recipe.py --config-name=coco2017_yolox architecture=yolox_l batch_size=4 val_batch_size=8 epochs=1 training_hyperparams.average_best_models=False training_hyperparams.max_train_batches=100 training_hyperparams.max_valid_batches=100 multi_gpu=DDP num_gpus=4
+
+      - run:
+          name: Remove new environment when failed
+          command: "rm -r << parameters.sg_new_env_name >>"
+          when: on_fail
+
+  recipe_sanity_tests_pose_estimation:
+    docker:
+      - image: 307629990626.dkr.ecr.us-east-1.amazonaws.com/deci/infra/circleci/runner/sg-gpu:<< pipeline.parameters.sg_docker_version >>
+    resource_class: deci-ai/sg-gpu-on-premise
+    parameters:
+      sg_existing_env_path:
+        type: string
+        default: "/env/persistent_env"
+      sg_new_env_name:
+        type: string
+        default: "${CIRCLE_BUILD_NUM}"
+      sg_new_env_python_version:
+        type: string
+        default: "python3.8"
+    steps:
+      - checkout
+      - run:
+          name: install requirements and run pose estimation sanity tests
+          command: |
+            << parameters.sg_new_env_python_version >> -m venv << parameters.sg_new_env_name >>
+            source << parameters.sg_new_env_name >>/bin/activate
+            python3.8 -m pip install --upgrade setuptools pip wheel
+            python3.8 -m pip install -r requirements.txt
+            python3.8 -m pip install .
+            python3.8 -m pip install torch torchvision torchaudio
+            python3.8 src/super_gradients/examples/train_from_recipe_example/train_from_recipe.py --config-name=coco2017_pose_dekr_w32_no_dc experiment_name=shortened_coco2017_pose_dekr_w32_ap_test batch_size=4 val_batch_size=8 epochs=1 training_hyperparams.lr_warmup_steps=0 training_hyperparams.average_best_models=False training_hyperparams.max_train_batches=1000 training_hyperparams.max_valid_batches=100 multi_gpu=DDP num_gpus=4
+
+      - run:
+          name: Remove new environment when failed
+          command: "rm -r << parameters.sg_new_env_name >>"
+          when: on_fail
+
+  docker-build-and-publish-branch:
+    docker:
+      - image: cimg/base:stable-20.04
+    parameters:
+      repo_name:
+        type: string
+        default: "deci/super-gradients"
+      docker_context:
+        type: string
+        default: "."
+      additional_tags:
+        type: string
+        default: ''
+    steps:
+      - setup_remote_docker:
+          version: 20.10.7
+          docker_layer_caching: true
+      - deci-common/container_image_lint_tag:
+          image_tag: "${CIRCLE_BRANCH}"
+      - run:
+          command: |
+            ADDITIONAL_TAGS="<< parameters.additional_tags >>"
+            echo "export ADDITIONAL_TAGS=${ADDITIONAL_TAGS}" >> $BASH_ENV
+      - run:
+          command: |
+            source $BASH_ENV
+            echo "$CONTAINER_LINT_TAG"
+            echo "$ADDITIONAL_TAGS"
+      - when:
+          condition: << pipeline.parameters.ad_hoc_container_build_code_only >>
+          steps:
+            - build_and_publish_command:
+                repo_name: << parameters.repo_name >>
+                docker_context: << parameters.docker_context >>
+                image_tag: $CONTAINER_LINT_TAG
+                additional_tags: $ADDITIONAL_TAGS
+                dockerfile: 'scripts/Dockerfile.branch.code'
+                build_args: "BASE_TAG=$CONTAINER_LINT_TAG"
+      - unless:
+          condition: << pipeline.parameters.ad_hoc_container_build_code_only >>
+          steps:
+            - build_and_publish_command:
+                repo_name: << parameters.repo_name >>
+                docker_context: << parameters.docker_context >>
+                image_tag: $CONTAINER_LINT_TAG
+                additional_tags: $ADDITIONAL_TAGS
+                dockerfile: 'scripts/Dockerfile.branch'
+
+workflows:
+  release:
+    unless:
+      or:
+        - << pipeline.parameters.ad_hoc_container_build >>
+        - << pipeline.parameters.ad_hoc_container_build_code_only >>
+    jobs:
+      - deci-common/persist_version_info:
+          version_override: $CIRCLE_TAG
+          <<: *release_tag_filter
+      - deci-common/codeartifact_login:
+          name: "login_to_codeartifact_release"
+          repo_name: "deci-packages"
+          <<: *release_tag_filter
+      - build:
+          name: "build3.8"
+          py_version: "3.8"
+          package_name: "super-gradients"
+          requires:
+            - deci-common/persist_version_info
+            - login_to_codeartifact_release
+          <<: *release_tag_filter
+      - recipe_sanity_tests_classification_pt1:
+          <<: *release_tag_filter
+      - recipe_sanity_tests_classification_pt2:
+          <<: *release_tag_filter
+      - recipe_sanity_tests_segmentation:
+          <<: *release_tag_filter
+      - recipe_sanity_tests_detection:
+          <<: *release_tag_filter
+      - recipe_sanity_tests_pose_estimation:
+          <<: *release_tag_filter
+      - recipe_accuracy_tests:
+          <<: *release_tag_filter
+      - release_version:
+          py_version: "3.8"
+          requires:
+            - "build3.8"
+            - recipe_accuracy_tests
+            - recipe_sanity_tests_classification_pt1
+            - recipe_sanity_tests_classification_pt2
+            - recipe_sanity_tests_segmentation
+            - recipe_sanity_tests_detection
+            - recipe_sanity_tests_pose_estimation
+          <<: *release_tag_filter
+      - deci-common/pip_upload_package_from_codeartifact_to_global_pypi:
+          package_name: "super-gradients"
+          name: "upload_super_gradients_to_pypi"
+          version: $CIRCLE_TAG
+          requires:
+            - "release_version"
+          context:
+            - pypi-supergradients
+          <<: *release_tag_filter
+
+
+  build_and_deploy:
+    unless:
+      or:
+        - << pipeline.parameters.ad_hoc_container_build >>
+        - << pipeline.parameters.ad_hoc_container_build_code_only >>
+    jobs:
+      - deci-common/persist_version_info:
+          use_rc: true
+          use_beta: false
+          version_override: ""
+
+      - build:
+          name: "build3.8"
+          py_version: "3.8"
+          package_name: "super-gradients"
+          requires:
+            - deci-common/persist_version_info
+
+      - deci-common/codeartifact_login:
+          repo_name: "deci-packages"
+          <<: *release_candidate_filter
+
+      - release_candidate: # happens on merge
+          py_version: "3.8"
+          requires:
+            - "build3.8"
+            - deci-common/codeartifact_login
+          <<: *release_candidate_filter
+
+  SG_docker:
+    unless:
+      or:
+        - << pipeline.parameters.ad_hoc_container_build >>
+        - << pipeline.parameters.ad_hoc_container_build_code_only >>
+    jobs:
+      - change_rc_to_b: # works on release candidate creation
+          <<: *release_candidate_tag_filter
+      - build_and_publish_sg_container:  # works on release candidate creation
+          requires:
+            - "change_rc_to_b"
+          <<: *release_candidate_tag_filter
+      - testing_supergradients_docker_image:  # works on release candidate creation
+          image_repo: '307629990626.dkr.ecr.us-east-1.amazonaws.com/deci/super-gradients'
+          requires:
+            - "build_and_publish_sg_container"
+            - "change_rc_to_b"
+          <<: *release_candidate_tag_filter
+      - add_rc_tag_to_beta: # works on release candidate creation for ECR Repo
+          requires:
+            - "testing_supergradients_docker_image"
+            - "change_rc_to_b"
+          <<: *release_candidate_tag_filter
+      - find_rc_tag_per_sha: # works on release
+          <<: *release_tag_filter
+      - add_release_tag_to_rc: # works on release
+          requires:
+            - "find_rc_tag_per_sha"
+          <<: *release_tag_filter
+      - slack/on-hold:
+          context: slack
+          channel: "sg-integration-tests"
+          requires:
+           - "add_release_tag_to_rc"
+          <<: *release_tag_filter
+      - hold-sg-public-release:  # works on release
+          type: approval
+          requires:
+           - "slack/on-hold"
+          <<: *release_tag_filter
+      - docker/publish:  # works on release
+          executor:
+              image: cimg/base
+              tag: stable-20.04
+              name: docker/docker
+          image: deciai/super-gradients
+          remote-docker-version: << pipeline.parameters.remote_docker_version >>
+          update-description: true
+          use-buildkit: true
+          use-remote-docker: true
+          use-docker-credentials-store: true
+          path: ./scripts
+          readme: ../README.md
+          tag: latest,${CIRCLE_TAG}
+          extra_build_args: '--build-arg VERSION=${CIRCLE_TAG}' #building from scratch as it faster and cheaper than download and retag
+          requires:
+            - "hold-sg-public-release"
+          <<: *release_tag_filter
+      - docker/publish: # works on release
+          executor:
+              image: cimg/base
+              tag: stable-20.04
+              name: docker/docker
+          image: deciai/super-gradients
+          remote-docker-version: << pipeline.parameters.remote_docker_version >>
+          update-description: false
+          use-buildkit: true
+          use-remote-docker: true
+          use-docker-credentials-store: true
+          path: ./scripts
+          tag: ${CIRCLE_TAG}-runtime
+          extra_build_args: '--build-arg VERSION=${CIRCLE_TAG} --build-arg DOCKER_IMAGE_TAG=11.3.1-runtime-ubuntu20.04'
+          requires:
+            - "hold-sg-public-release"
+          <<: *release_tag_filter
+  build-and-push-container-flow:
+    when: << pipeline.parameters.ad_hoc_container_build >>
+    jobs:
+      - docker-build-and-publish-branch
+  build-and-push-container-code-only-flow:
+    when: << pipeline.parameters.ad_hoc_container_build_code_only >>
+    jobs:
+      - docker-build-and-publish-branch
