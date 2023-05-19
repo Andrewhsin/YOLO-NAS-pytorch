@@ -120,7 +120,7 @@ ________________________________________________________________________________
 pip install super-gradients
 ```
     
-### 🎒 Prepare Dataset
+###  Prepare Your Dataset
 Your custom dataset should be in **COCO** or **YOLO** data format.<br>
 **Data Format**:
 ```
@@ -128,28 +128,28 @@ Your custom dataset should be in **COCO** or **YOLO** data format.<br>
 │   ├── train
 │   │   ├── images
 │   │   │   ├── 1.jpg
-│   │   │   ├── abc.png
+│   │   │   ├── 2.jpg
 |   |   |   ├── ....
 │   │   ├── labels
 │   │   │   ├── 1.txt
-│   │   │   ├── abc.txt
+│   │   │   ├── 2.txt
 |   |   |   ├── ....
 │   ├── val
 │   │   ├── images
-│   │   │   ├── 2.jpg
-│   │   │   ├── fram.png
+│   │   │   ├── 1.jpg
+│   │   │   ├── 2.png
 |   |   |   ├── ....
 │   │   ├── labels
+│   │   │   ├── 1.txt
 │   │   │   ├── 2.txt
-│   │   │   ├── fram.txt
 |   |   |   ├── ....
 │   ├── test
 │   │   ├── images
-│   │   │   ├── img23.jpeg
+│   │   │   ├── 1.jpg
 │   │   │   ├── 50.jpg
 |   |   |   ├── ....
 │   │   ├── labels
-│   │   │   ├── img23.txt
+│   │   │   ├── 1.txt
 │   │   │   ├── 50.txt
 |   |   |   ├── ....
 ```
@@ -173,7 +173,7 @@ labels:
   val: valid/labels
 ```
 
-## 🤖 Train
+##  Train Your Custom Dataset
 You can train your **YOLO-NAS** model with **Single Command Line**
 
 <details>
@@ -193,6 +193,36 @@ You can train your **YOLO-NAS** model with **Single Command Line**
 ```
 python3 train.py --data /dir/dataset/data.yaml --batch 6 --epoch 100 --model yolo_nas_m
 ```
+    
+##  Inference
+You can Inference your **YOLO-NAS** model with **Single Command Line**
+#### Support
+- Video
+- Camera
+- RTSP
+
+<details>
+  <summary>Args</summary>
+  
+  `-i`, `--data`: path to data.yaml <br>
+  `-m`, `--model`: Model type (eg: `yolo_nas_s`, `yolo_nas_m`, `yolo_nas_l`) <br>
+  `-w`, `--weight`: path to trained model weight <br>
+  `-s`, `--source`: video path/cam-id/RTSP <br>
+  `-c`, `--conf`: model prediction confidence (0<conf<1) <br>
+  `--save`: to save video <br>
+  `--hide`: hide video window
+
+</details>
+
+**Example:**
+```
+python3 inference.py --data /dir/dataset/data.yaml --model yolo_nas_m --weight /runs/train4/ckpt_best.pth --source /test/video.mp4 --conf 0.66           # video
+                                                                                                          --source /test/video.mp4 --conf 0.75 --hide    # to save and hide video window
+                                                                                                          --source 0 --conf 0.45                         # Camera
+                                                                                                          --source 'rtsp://link' --conf 0.25 --save      # save RTSP video stream
+
+```
+
 
 
 ## What's New - Version 3.1.1 (May 3rd)
