@@ -1,0 +1,10 @@
+# train and val datasets (image directory or *.txt file with image paths)
+train: D:/yoloair-iscyy-beta/battery_mix_all/train/ # 118k images
+val:  D:/yoloair-iscyy-beta/battery_mix_all/val/ # 5k images
+test: E:/yolor-main/TT100K/data/test/  # 20k images for submission to https://competitions.codalab.org/competitions/20794
+
+# number of classes
+nc: 9
+
+# class names
+names: ['1','2','3','4','5','6','9','b','ng']
